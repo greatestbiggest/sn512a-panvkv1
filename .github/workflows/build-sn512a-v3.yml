@@ -20,7 +20,7 @@ jobs:
           python3 -m venv .sn512a-venv
           source .sn512a-venv/bin/activate
           python3 -m pip install --upgrade pip 'meson>=1.5,<2' mako pyyaml packaging
-          - uses: android-actions/setup-android@v3
+          - uses: android-actions/setup-android@v4
            with:
           packages: 'platform-tools'
       - name: Install pinned Android NDK
