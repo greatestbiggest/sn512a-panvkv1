@@ -1,0 +1,1075 @@
+# V12: fix the missing *legacy* Android gralloc CPU usage request; retain V11 vertex32.
+# V11 extends real PanVK MAX_VBS software storage and VkPhysicalDeviceLimits
+# from 16 to 32; 64 needs a broader audit of uint32 masks, so is not advertised.
+# V12 extends V10 native-buffer handling by requesting mappable swapchain allocations from the legacy Android gralloc usage ABI.
+# SN512A: bypasses the failing direct jm-v9 001 patch by building the universal
+# Mesa stack in upstream prepare-rc5-tree.sh order (CSF-v11 before JM-v9).
+# v10: target Android native swapchain images where gralloc mapper access is
+# denied. Request CPU readable/writable gralloc allocation; use pinned Mesa's
+# 9-cookie AHB-vs-dma-buf proof ONLY for matching v11 native window AHBs.
+# Fail closed for missing AHB, unsafe layout or non-linear/modifier mismatch.
+# Experimental, untested on the Coosea SN512A; may not fix this device.
+# Same pinned Mesa, NDK, apt recovery, X11 deps, compiler, CSF+JM patch order.
+name: SN512A PanVK v12 - Vertex32 + Legacy Gralloc CPU Buffer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android-driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler and build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # Prevent a stalled package mirror from blocking GitHub Actions indefinitely.
+          # Timeouts are per connection; downloads retry before switching Ubuntu mirrors.
+          APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=35 \
+                    -o Acquire::https::Timeout=35 -o Acquire::http::Pipeline-Depth=0 \
+                    -o Dpkg::Use-Pty=0)
+          packages=(
+            git build-essential cmake ninja-build pkg-config python3-venv python3-mako
+            python3-yaml python3-ply python3-packaging bison flex libzstd-dev libxml2-dev
+            libdrm-dev clang llvm gettext autoconf automake libtool
+            gperf llvm-18-dev libclang-18-dev libllvmspirvlib-18-dev llvm-spirv-18 libclc-18 libclc-18-dev
+            spirv-tools glslang-tools libxcb1-dev libx11-dev libx11-xcb-dev libxshmfence-dev libxcb-dri3-dev
+            libxcb-present-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev libxcb-randr0-dev
+          )
+          sudo apt-get "${APT_OPTS[@]}" update
+          if ! sudo -E apt-get "${APT_OPTS[@]}" install -y "${packages[@]}"; then
+            echo "APT: initial mirror failed; retrying with Ubuntu main archive"
+            # Ubuntu 24.04 GitHub images may use Azure mirrors, which can intermittently stall.
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+            if [ -f /etc/apt/sources.list ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
+            fi
+            sudo apt-get "${APT_OPTS[@]}" update
+            sudo -E apt-get "${APT_OPTS[@]}" install -y "${packages[@]}"
+          fi
+          # Exact native headers inspected by upstream scripts/prepare-x11-headers.sh.
+          for h in /usr/include/xcb/xcb.h /usr/include/X11/Xlib-xcb.h /usr/include/X11/xshmfence.h; do
+            test -f "$h" || { echo "FATAL: expected X11/XCB host header missing: $h" >&2; exit 1; }
+            echo "OK host X11/XCB header: $h"
+          done
+          pkg-config --modversion xcb x11-xcb xshmfence
+          # LLVMSPIRVLib must match the chosen LLVM 18 host toolchain.
+          echo "LLVM host version: $(llvm-config-18 --version)"
+          echo "SPIR-V translator: $(pkg-config --modversion LLVMSPIRVLib)"
+          python3 -m venv .sn512a-venv
+          source .sn512a-venv/bin/activate
+          python3 -m pip install --upgrade pip 'meson>=1.5,<2' mako pyyaml packaging
+      # v4 fixes Android SDK 'tools' package removal; only platform-tools needed.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+      - name: Install pinned Android NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'ndk;28.2.13676358'
+      - name: Expand transparent embedded source and verify Python
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p sn512a-src/patches sn512a-src/scripts sn512a-src/tests
+          cat > 'sn512a-src/patches/bridge_owned_ahb_gralloc.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Conservative, targeted bridge for Android gralloc failures in Mesa vk_android.c.
+          v6 fixes v5's false assumption that the failure guard has no braces. The
+          returned Vulkan error is preserved unless PanVK owns the exact AHB and its
+          existing checked linear-layout probe verifies the imported allocation.
+          This cannot fix unowned native-window buffers or unsupported Mali pipelines.
+          """
+          from pathlib import Path
+          import argparse
+          import re
+          MARKER = '[SN512A-AHB-BRIDGE]'
+          PROLOG = '''static struct AHardwareBuffer *
+          panvk_sn512a_owned_ahb_for_gralloc(void);
+          static VkResult
+          vk_android_probe_linear_ahb(struct AHardwareBuffer *ahb,
+                                      const AHardwareBuffer_Desc *d,
+                                      const native_handle_t *h,
+                                      VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+                                      VkSubresourceLayout *out_layouts, int max_planes);
+          '''
+          GETTER = '''static struct AHardwareBuffer *
+          panvk_sn512a_owned_ahb_for_gralloc(void)
+          {
+             return (struct AHardwareBuffer *)vk_android_owned_ahb;
+          }
+          '''
+          # Replaces ONLY the return from the u_gralloc error branch, not the success
+          # path. A compound statement is valid in both braced and unbraced if branches.
+          FALLBACK = '''{
+             struct AHardwareBuffer *owned = panvk_sn512a_owned_ahb_for_gralloc();
+             if (owned && in_hnd->handle == AHardwareBuffer_getNativeHandle(owned)) {
+                AHardwareBuffer_Desc desc;
+                AHardwareBuffer_describe(owned, &desc);
+                mesa_logw("[SN512A-AHB-BRIDGE] gralloc failed for same driver-owned AHB; testing verified linear layout: %ux%u fmt=%u stride=%u usage=0x%llx",
+                          desc.width, desc.height, desc.format, desc.stride,
+                          (unsigned long long)desc.usage);
+                return vk_android_probe_linear_ahb(owned, &desc, in_hnd->handle,
+                                                   out, out_layouts, max_planes);
+             }
+             static __thread bool sn512a_warned_not_owned;
+             if (!sn512a_warned_not_owned) {
+                sn512a_warned_not_owned = true;
+                mesa_logw("[SN512A-AHB-BRIDGE] gralloc failed for unowned or unmatched native window buffer (fmt=%u stride=%u); refusing layout guess",
+                          in_hnd->hal_format, in_hnd->pixel_stride);
+             }
+             return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+          }'''
+          def skipws(s, index):
+              while index < len(s) and s[index].isspace():
+                  index += 1
+              return index
+          def balanced_end(s, start, op='(', cl=')'):
+              """Return the position immediately after a balanced parentheses/braces group."""
+              assert s[start] == op
+              nesting = 0
+              i = start
+              quote = None
+              while i < len(s):
+                  c = s[i]
+                  if quote:
+                      if c == '\\':
+                          i += 2
+                          continue
+                      if c == quote:
+                          quote = None
+                  elif c in '\"\'':
+                      quote = c
+                  elif c == op:
+                      nesting += 1
+                  elif c == cl:
+                      nesting -= 1
+                      if nesting == 0:
+                          return i+1
+                  i += 1
+              raise ValueError('Unbalanced conditional or guard block in pinned Mesa')
+          def patch(source):
+              if MARKER in source:
+                  # The marker is only put in our own fallback; refuse a suspicious preexisting one.
+                  if 'panvk_sn512a_owned_ahb_for_gralloc' not in source:
+                      raise ValueError('Found bridge marker without bridge getter; inconsistent source')
+                  return source
+              decl = 'static __thread const struct AHardwareBuffer *vk_android_owned_ahb;'
+              fn = 'static VkResult\nvk_gralloc_to_drm_explicit_layout('
+              if source.count(fn) != 1 or source.count(decl) != 1:
+                  raise ValueError('Expected one original Mesa layout function and one owned-AHB TLS declaration')
+              if source.count('vk_android_probe_linear_ahb(') < 2:
+                  raise ValueError('Upstream validated AHB probe (android/014) missing; unsafe to bridge')
+              begin = source.index(fn)
+              search_region = source[begin:begin + 3000]
+              guards = list(re.finditer(r'\bif\s*\(\s*u_gralloc_get_buffer_basic_info\s*\(', search_region))
+              if len(guards) != 1:
+                  raise ValueError(f'Expected one u_gralloc failure test in vk_gralloc layout (found {len(guards)})')
+              cond_start = begin + guards[0].start()
+              open_paren = source.index('(', cond_start)
+              cond_end = balanced_end(source, open_paren)
+              condition = source[open_paren:cond_end]
+              if not re.search(r'!=\s*0', condition):
+                  raise ValueError('Unexpected gralloc condition; refusing source modification')
+              statement_start = skipws(source, cond_end)
+              if source[statement_start] == '{':
+                  statement_end = balanced_end(source, statement_start, '{', '}')
+              else:
+                  statement_end = source.find(';', statement_start) + 1
+                  if statement_end == 0:
+                      raise ValueError('Unterminated non-braced gralloc error statement')
+              statement = source[statement_start:statement_end]
+              target = re.compile(r'\breturn\s+VK_ERROR_INVALID_EXTERNAL_HANDLE\s*;')
+              if len(target.findall(statement)) != 1:
+                  raise ValueError(f'Error branch did not contain exactly one matching return: {statement[:250]!r}')
+              # A single, bracketed body is valid for `if` statements lacking braces.
+              repaired = target.sub(lambda _: FALLBACK, statement, count=1)
+              result = source[:statement_start] + repaired + source[statement_end:]
+              result = result.replace(fn, PROLOG + fn, 1)
+              result = result.replace(decl, decl + '\n\n' + GETTER, 1)
+              if MARKER not in result or result.count('panvk_sn512a_owned_ahb_for_gralloc(') != 3:
+                  raise AssertionError('Bridge injection sanity check failed')
+              return result
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('mesa_root', type=Path)
+              parser.add_argument('--dry-run', action='store_true')
+              args = parser.parse_args()
+              f = args.mesa_root / 'src/vulkan/runtime/vk_android.c'
+              if not f.is_file():
+                  parser.error(f'Missing Mesa Android Vulkan runtime source at {f}')
+              original = f.read_text()
+              try:
+                  changed = patch(original)
+              except ValueError as exc:
+                  print('SN512A SOURCE-DRIFT:', exc)
+                  # Output enough source to correct this without another blind guess.
+                  key = original.find('vk_gralloc_to_drm_explicit_layout(')
+                  print('Relevant upstream vk_android.c snippet:')
+                  print(original[max(0,key-70):key+1100])
+                  raise
+              if changed == original:
+                  print('Bridge already present')
+              elif args.dry_run:
+                  print('Bridge passes guard discovery and owned-AHB proof preconditions; dry run')
+              else:
+                  f.write_text(changed)
+                  print('SN512A-BRIDGE-INSTALLED:', f)
+                  print('Only owned matching AHBs receive upstream 9-cookie linear layout proof.')
+          if __name__ == '__main__':
+              main()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/patches/instrument_android_routes.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Add one-time per-thread path logs to patched Mesa vk_android.c.
+          
+          The user's error log references Android vkCreateImage native buffers, not
+          necessarily the driver-owned AHB that the upstream CPU probe requires.
+          Do not weaken buffer validation: this patch only adds logs.
+          """
+          from pathlib import Path
+          import argparse
+          MARKER = '[SN512A-ROUTE]'
+          
+          NATIVE = """   static __thread bool sn512a_native_seen;
+             if (!sn512a_native_seen) {
+                sn512a_native_seen = true;
+                mesa_logw("[SN512A-ROUTE] vk_android_get_anb_layout used: native window gralloc import; AHB ownership probe may be inapplicable");
+             }
+             return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,"""
+          
+          # No risk to window framebuffers: both are only diagnostic statements.
+          AHB = """   static __thread bool sn512a_ahb_seen;
+             if (!sn512a_ahb_seen) {
+                sn512a_ahb_seen = true;
+                mesa_logw("[SN512A-ROUTE] vk_android_get_ahb_layout used: explicit AHardwareBuffer import");
+             }
+             VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,"""
+          
+          def apply(src):
+              if MARKER in src:
+                  return src
+              # Strict, version-pinned known-Mesa anchors. Fail before modifying anything.
+              n = 'return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,'
+              a = 'VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,'
+              if src.count(n) != 1 or src.count(a) != 1:
+                  raise ValueError('Unexpected vk_android.c source layout; do not patch')
+              return src.replace(n, NATIVE, 1).replace(a, AHB, 1)
+          
+          def main():
+              ap=argparse.ArgumentParser(description=__doc__)
+              ap.add_argument('mesa_root',type=Path)
+              ap.add_argument('--dry-run',action='store_true')
+              args=ap.parse_args()
+              f=args.mesa_root/'src/vulkan/runtime/vk_android.c'
+              if not f.is_file(): ap.error('Missing source: '+str(f))
+              before=f.read_text(); after=apply(before)
+              if before==after: print('Already instrumented')
+              elif args.dry_run: print('Route instrumentation anchors validated')
+              else: f.write_text(after); print('Instrumented two Mesa Android import routes:',f)
+          if __name__=='__main__': main()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/patches/probe_native_anb_v10.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """SN512A V10 experimental native-window AHB proof on stock Android 15.
+          
+          V9 could only prove *driver-allocated* AHB layouts. Liberty's Android WSI
+          supplies ANativeWindow/ANB handles which do not hit that branch. V10 requests
+          CPU-readable/writable swapchain allocations and tries the existing upstream
+          9-cookie, DMA-BUF-vs-AHardwareBuffer verified LINEAR probe, but ONLY if Android
+          passes an AHB for the *exact same* native handle and reports matching geometry.
+          
+          The generated C temporarily advertises the imported AHB to Mesa's proof routine
+          for its duration. This DOES write test cookies to the window buffer. It is
+          limited to native swapchain images being created with CPU access enabled.
+          It is not a general bypass of gralloc and does not fabricate DRM metadata.
+          
+          Not compile or hardware verified. Fail closed on source drift.
+          """
+          from pathlib import Path
+          import argparse
+          import re
+          
+          MARKER = '[SN512A-V10-ANB]'
+          
+          # This is in the block for VK_ANDROID_native_buffer, where v11's .ahb field is
+          # defined. Only the CPU-readable/writable, exact-match path can run the probe.
+          FALLBACK = r'''VkResult sn512a_v10_result =
+                vk_gralloc_to_drm_explicit_layout(&gr_handle, out, out_layouts, max_planes);
+             if (sn512a_v10_result != VK_ERROR_INVALID_EXTERNAL_HANDLE)
+                return sn512a_v10_result;
+          #if VK_ANDROID_NATIVE_BUFFER_SPEC_VERSION >= 11
+             static __thread bool sn512a_v10_logged;
+             const struct AHardwareBuffer *sn512a_v10_ahb = native_buffer->ahb;
+             if (!sn512a_v10_ahb) {
+                if (!sn512a_v10_logged) {
+                   sn512a_v10_logged = true;
+                   mesa_logw("[SN512A-V10-ANB] native buffer has no AHB pointer; cannot verify layout");
+                }
+                return sn512a_v10_result;
+             }
+             /* Check pointer identity BEFORE using any descriptor from the AHB. */
+             if (AHardwareBuffer_getNativeHandle(sn512a_v10_ahb) != native_buffer->handle) {
+                if (!sn512a_v10_logged) {
+                   sn512a_v10_logged = true;
+                   mesa_logw("[SN512A-V10-ANB] ANB/AHB native handles differ; refusing layout guess");
+                }
+                return sn512a_v10_result;
+             }
+             AHardwareBuffer_Desc sn512a_v10_desc;
+             AHardwareBuffer_describe(sn512a_v10_ahb, &sn512a_v10_desc);
+             /* Vulkan swapchain contents are undefined during image creation. We must
+              * also explicitly request *both* CPU permissions from gralloc before
+              * cookie-writing the buffer; compressed and unsupported buffers fail.
+              * Restrict this experiment to single-plane 32bpp UNORM RGBA/RGBX. */
+             const uint64_t sn512a_v10_cpu_read = AHARDWAREBUFFER_USAGE_CPU_READ_MASK;
+             const uint64_t sn512a_v10_cpu_write = AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK;
+             bool sn512a_v10_supported =
+                pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                (pCreateInfo->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
+                sn512a_v10_desc.layers == 1 &&
+                sn512a_v10_desc.width == pCreateInfo->extent.width &&
+                sn512a_v10_desc.height == pCreateInfo->extent.height &&
+                sn512a_v10_desc.stride >= sn512a_v10_desc.width &&
+                sn512a_v10_desc.stride == (uint32_t)native_buffer->stride &&
+                sn512a_v10_desc.format == (uint32_t)native_buffer->format &&
+                (sn512a_v10_desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ||
+                 sn512a_v10_desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM) &&
+                (sn512a_v10_desc.usage & sn512a_v10_cpu_read) != 0 &&
+                (sn512a_v10_desc.usage & sn512a_v10_cpu_write) != 0;
+             if (!sn512a_v10_supported) {
+                if (!sn512a_v10_logged) {
+                   sn512a_v10_logged = true;
+                   mesa_logw("[SN512A-V10-ANB] AHB descriptor unsupported %ux%u fmt=%u stride=%u usage=0x%llx; refusing layout guess",
+                             sn512a_v10_desc.width, sn512a_v10_desc.height,
+                             sn512a_v10_desc.format, sn512a_v10_desc.stride,
+                             (unsigned long long)sn512a_v10_desc.usage);
+                }
+                return sn512a_v10_result;
+             }
+             /* Preserve upstream ownership TLS around this *scoped* validation. The
+              * physical owner remains Android; only image creation may touch this AHB. */
+             const struct AHardwareBuffer *sn512a_v10_prev =
+                panvk_sn512a_owned_ahb_for_gralloc();
+             vk_android_set_owned_ahb(sn512a_v10_ahb);
+             sn512a_v10_result = vk_android_probe_linear_ahb(
+                (struct AHardwareBuffer *)sn512a_v10_ahb, &sn512a_v10_desc,
+                native_buffer->handle, out, out_layouts, max_planes);
+             vk_android_set_owned_ahb(sn512a_v10_prev);
+             if (!sn512a_v10_logged) {
+                sn512a_v10_logged = true;
+                mesa_logw("[SN512A-V10-ANB] verified native-window linear probe result=%d",
+                          sn512a_v10_result);
+             }
+          #endif
+             return sn512a_v10_result;'''
+          
+          # The v2 getter declaration sits earlier in vk_android.c; the predicate also
+          # ensures we cannot silently compile a second, unrelated probe.
+          USAGE_ADDITION = r'''   /* SN512A V10: request CPU-readable + writable (rarely) gralloc buffers.
+              * If the platform cannot honor this, the AHB proof fails closed. */
+             *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_CPU_READ;
+             *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_WRITE;
+             mesa_logi("[SN512A-V10-ANB] requested CPU-accessible Android swapchain usage");
+          '''
+          
+          
+          def get_function(source: str, signature: str) -> tuple[int, int, str]:
+              match = re.search(signature, source)
+              if not match:
+                  raise ValueError(f'Missing source signature {signature!r}')
+              opening = source.find('{', match.end())
+              if opening < 0 or opening > match.end() + 500:
+                  raise ValueError('Malformed C function')
+              level = 0
+              for i in range(opening, len(source)):
+                  if source[i] == '{':
+                      level += 1
+                  elif source[i] == '}':
+                      level -= 1
+                      if level == 0:
+                          return match.start(), i + 1, source[match.start():i+1]
+              raise ValueError('Unbalanced C braces')
+          
+          
+          def patch(source: str) -> str:
+              if MARKER in source:
+                  if (source.count('[SN512A-V10-ANB] native buffer') != 1 or
+                          'GRALLOC1_CONSUMER_USAGE_CPU_READ' not in source):
+                      raise ValueError('Partial V10 patch')
+                  return source
+              if '[SN512A-AHB-BRIDGE]' not in source:
+                  raise ValueError('Requires V9 bridge patch first')
+              if '[SN512A-ROUTE]' not in source:
+                  raise ValueError('Requires V9 native-path instrumentation first')
+              if not all(s in source for s in (
+                  'vk_android_probe_linear_ahb(',
+                  'panvk_sn512a_owned_ahb_for_gralloc()',
+                  'vk_android_set_owned_ahb(',
+              )):
+                  raise ValueError('Source missing pinned Mesa AHB proof prerequisites')
+          
+              a, b, fn = get_function(source, r'\bvk_android_get_anb_layout\s*\(')
+              # This function's call must be its final return. Never patch the AHB path.
+              target = re.compile(r'\breturn\s+vk_gralloc_to_drm_explicit_layout\s*\(\s*&gr_handle\s*,\s*out\s*,\s*out_layouts\s*,\s*max_planes\s*\)\s*;')
+              if len(target.findall(fn)) != 1:
+                  raise ValueError('Cannot find exactly one native-buffer layout return')
+              result = source[:a] + target.sub(lambda _: FALLBACK, fn, count=1) + source[b:]
+          
+              a, b, fn = get_function(result, r'\bvk_common_GetSwapchainGrallocUsage2ANDROID\s*\(')
+              return_anchor = re.compile(r'\breturn\s+VK_SUCCESS\s*;')
+              matches = list(return_anchor.finditer(fn))
+              if len(matches) != 1 or 'GRALLOC1_PRODUCER_USAGE_GPU_RENDER_TARGET' not in fn:
+                  raise ValueError('Unexpected gralloc-usage function layout')
+              # Replace final return, not setup failures.
+              new_fn = fn[:matches[0].start()] + USAGE_ADDITION + fn[matches[0].start():]
+              result = result[:a] + new_fn + result[b:]
+              if result.count('[SN512A-V10-ANB]') != 5:
+                  raise AssertionError('Expected five V10 diagnostic message tags')
+              return result
+          
+          
+          def main():
+              ap = argparse.ArgumentParser(description=__doc__)
+              ap.add_argument('mesa_root', type=Path)
+              ap.add_argument('--dry-run', action='store_true')
+              args = ap.parse_args()
+              file = args.mesa_root / 'src/vulkan/runtime/vk_android.c'
+              before = file.read_text()
+              after = patch(before)
+              if args.dry_run:
+                  print('SN512A V10 source guards OK')
+              elif before == after:
+                  print('SN512A V10 already patched')
+              else:
+                  file.write_text(after)
+                  print('SN512A V10 applied:', file)
+          
+          
+          if __name__ == '__main__':
+              main()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/tests/test_v10_patcher.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Source-to-source guard checks; NOT hardware or cross-compile tests."""
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'patches'))
+          from probe_native_anb_v10 import patch
+          
+          SRC = r'''#include "vk_android.h"
+          /* [SN512A-AHB-BRIDGE] */
+          /* [SN512A-ROUTE] */
+          static void panvk_sn512a_owned_ahb_for_gralloc();
+          static void vk_android_probe_linear_ahb();
+          void vk_android_set_owned_ahb();
+          VkResult vk_android_get_anb_layout(
+             const VkImageCreateInfo *pCreateInfo,
+             VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+             VkSubresourceLayout *out_layouts, int max_planes)
+          {
+             const VkNativeBufferANDROID *native_buffer = pCreateInfo->pNext;
+             struct u_gralloc_buffer_handle gr_handle = {
+                .handle = native_buffer->handle,
+                .hal_format = native_buffer->format,
+                .pixel_stride = native_buffer->stride,
+             };
+             return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+                                                       out_layouts, max_planes);
+          }
+          VkResult vk_common_GetSwapchainGrallocUsage2ANDROID(VkDevice device,
+             VkFormat format, VkImageUsageFlags imageUsage,
+             VkSwapchainImageUsageFlagsANDROID swapchainImageUsage,
+             uint64_t *grallocConsumerUsage, uint64_t *grallocProducerUsage)
+          {
+             *grallocConsumerUsage = *grallocProducerUsage = 0;
+             if (gralloc_usage & GRALLOC_USAGE_HW_RENDER)
+                *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_GPU_RENDER_TARGET;
+             if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
+                *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;
+             return VK_SUCCESS;
+          }
+          '''
+          
+          def run():
+              out = patch(SRC)
+              assert out.count('[SN512A-V10-ANB]') == 5
+              assert 'native_buffer->ahb' in out
+              assert 'VK_IMAGE_LAYOUT_UNDEFINED' in out
+              assert 'VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT' in out
+              assert 'AHardwareBuffer_getNativeHandle(sn512a_v10_ahb) != native_buffer->handle' in out
+              assert 'AHARDWAREBUFFER_USAGE_CPU_READ_MASK' in out
+              assert 'AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK' in out
+              assert 'GRALLOC1_CONSUMER_USAGE_CPU_READ;' in out
+              assert 'GRALLOC1_PRODUCER_USAGE_CPU_WRITE;' in out
+              assert 'vk_android_probe_linear_ahb(' in out
+              assert 'vk_android_set_owned_ahb(sn512a_v10_prev);' in out
+              assert patch(out) == out
+              try:
+                  patch(SRC.replace('panvk_sn512a_owned_ahb_for_gralloc();', ''))
+                  raise AssertionError('Missing safety precondition accepted')
+              except ValueError:
+                  pass
+              try:
+                  patch(SRC.replace('GRALLOC1_PRODUCER_USAGE_GPU_RENDER_TARGET', 'UNKNOWN_FLAG'))
+                  raise AssertionError('Unexpected usage function accepted')
+              except ValueError:
+                  pass
+              print('V10 guard tests: 2 negative checks, idempotence, native handle, usage & proof gating PASS')
+          
+          if __name__ == '__main__':
+              run()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/tests/test_c_syntax.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Host syntax check for emitted C branch. Real Mesa build is still required."""
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          from test_v10_patcher import SRC
+          import sys
+          sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'patches'))
+          from probe_native_anb_v10 import patch
+          
+          PREFACE = r'''
+          #include <stdint.h>
+          #include <stdbool.h>
+          #include <stddef.h>
+          #define VK_ANDROID_NATIVE_BUFFER_SPEC_VERSION 11
+          #define VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)
+          #define VK_SUCCESS 0
+          #define VK_IMAGE_LAYOUT_UNDEFINED 0
+          #define VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT 0x10
+          #define AHARDWAREBUFFER_USAGE_CPU_READ_MASK 0xfULL
+          #define AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK 0xf0ULL
+          #define AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM 1
+          #define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
+          #define GRALLOC1_CONSUMER_USAGE_CPU_READ 2ULL
+          #define GRALLOC1_PRODUCER_USAGE_CPU_WRITE 32ULL
+          #define GRALLOC1_PRODUCER_USAGE_GPU_RENDER_TARGET 512ULL
+          #define GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE 256ULL
+          #define GRALLOC_USAGE_HW_RENDER 1
+          #define GRALLOC_USAGE_HW_TEXTURE 2
+          #define VK_ANDROID_NATIVE_BUFFER_SPEC_VERSION 11
+          #define VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID 1
+          struct native_handle { int foo; };
+          typedef struct native_handle native_handle_t;
+          typedef struct AHardwareBuffer AHardwareBuffer;
+          typedef struct AHardwareBuffer_Desc {
+            uint32_t width, height, layers, format, stride;
+            uint64_t usage;
+          } AHardwareBuffer_Desc;
+          typedef struct VkSubresourceLayout { int foo; } VkSubresourceLayout;
+          typedef struct VkImageDrmFormatModifierExplicitCreateInfoEXT { int foo; } VkImageDrmFormatModifierExplicitCreateInfoEXT;
+          typedef struct VkNativeBufferANDROID {
+            const native_handle_t *handle;
+            int format, stride;
+            AHardwareBuffer *ahb;
+          } VkNativeBufferANDROID;
+          typedef struct VkImageCreateInfo {
+            const VkNativeBufferANDROID *pNext;
+            int initialLayout;
+            int usage;
+            struct { uint32_t width, height; } extent;
+          } VkImageCreateInfo;
+          typedef int VkResult;
+          typedef void *VkDevice;
+          typedef int VkFormat, VkImageUsageFlags, VkSwapchainImageUsageFlagsANDROID;
+          struct u_gralloc_buffer_handle { const native_handle_t *handle; int hal_format, pixel_stride; };
+          const native_handle_t *AHardwareBuffer_getNativeHandle(const AHardwareBuffer *);
+          void AHardwareBuffer_describe(const AHardwareBuffer *, AHardwareBuffer_Desc *);
+          void mesa_logw(const char *, ...);
+          void mesa_logi(const char *, ...);
+          void vk_android_set_owned_ahb(const AHardwareBuffer *);
+          const AHardwareBuffer *panvk_sn512a_owned_ahb_for_gralloc(void);
+          VkResult vk_android_probe_linear_ahb(AHardwareBuffer *, const AHardwareBuffer_Desc *,
+             const native_handle_t *, VkImageDrmFormatModifierExplicitCreateInfoEXT *,
+             VkSubresourceLayout *, int);
+          VkResult vk_gralloc_to_drm_explicit_layout(const struct u_gralloc_buffer_handle *,
+             VkImageDrmFormatModifierExplicitCreateInfoEXT *, VkSubresourceLayout *, int);
+          static int gralloc_usage;
+          '''
+          
+          
+          def run():
+              src = PREFACE + '\n' + patch(SRC).replace('#include "vk_android.h"', '').replace(
+                  'static void panvk_sn512a_owned_ahb_for_gralloc();',
+                  '/* already declared */'
+              ).replace('static void vk_android_probe_linear_ahb();',
+                        '/* already declared */').replace(
+                            'void vk_android_set_owned_ahb();', '/* already declared */')
+              with tempfile.TemporaryDirectory() as tmp:
+                  c = Path(tmp) / 'snippet.c'
+                  c.write_text(src)
+                  tool = os.environ.get('CC', 'clang')
+                  result = subprocess.run([tool, '-std=gnu11', '-Werror', '-Wno-unused-parameter',
+                                           '-fsyntax-only', str(c)], capture_output=True, text=True)
+                  if result.returncode != 0:
+                      print(result.stderr)
+                      raise AssertionError(f'Native-window V10 C fragment failed {tool} syntax test')
+              print('V10 generated C fragment syntax: PASS')
+          
+          if __name__ == '__main__':
+              run()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/scripts/package_liberty_driver.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Create Liberty's no-root custom-driver zip from a real compiled Android .so.
+          Fails closed for an absent, non-ELF, non-aarch64 or empty shared library.
+          """
+          import sys, json, zipfile, hashlib
+          from pathlib import Path
+          if len(sys.argv)!=3: raise SystemExit('usage: package_liberty_driver.py libvulkan_panfrost.so result.zip')
+          lib,out=map(Path,sys.argv[1:])
+          blob=lib.read_bytes()
+          assert len(blob)>100000 and blob[:4]==b'\x7fELF' and blob[4]==2 and blob[5]==1, 'Expected 64-bit little-endian ELF .so'
+          assert int.from_bytes(blob[18:20],'little')==183, 'Expected AArch64 ELF machine 183'
+          meta={'name':'PanVK-SN512A-VERTEX32-GRALLOC-v12','author':'SN512A source instrumentation','version':'0.0.12-experimental','description':'Experimental PanVK for Coosea SN512A; 32 PanVK vertex attributes and bindings (MAX_VBS); requests CPU-mappable legacy Android swapchain buffers; keeps V10 9-cookie proof; device-unverified','libraryName':'libvulkan_panfrost.so'}
+          with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as z:
+           z.writestr('meta.json',json.dumps(meta,indent=2)+'\n')
+           z.write(lib,'libvulkan_panfrost.so')
+           z.writestr('SHA256SUMS.txt',f'{hashlib.sha256(blob).hexdigest()}  libvulkan_panfrost.so\n')
+          print(out, 'sha256', hashlib.sha256(out.read_bytes()).hexdigest())
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/scripts/build_driver.sh' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env bash
+          # Pinned upstream build. Requires Linux, network, NDK and Meson; no fake binaries.
+          set -Eeuo pipefail
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+          WORK="${1:-$PWD/sn512a-build}"
+          mkdir -p "$WORK"; WORK="$(cd "$WORK" && pwd)"
+          for tool in git meson ninja python3; do command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 2; }; done
+          [[ -d "${ANDROID_NDK_ROOT:-}/toolchains" ]] || { echo 'ANDROID_NDK_ROOT must point to an installed Android NDK directory' >&2; exit 2; }
+          if [[ ! -d "$WORK/panvk-kbase-android/.git" ]]; then
+            git clone --single-branch --depth 1 --branch panvk-kbase-v26.3.1 \
+              https://github.com/zenithblue-oss/panvk-kbase-android.git "$WORK/panvk-kbase-android"
+          fi
+          cd "$WORK/panvk-kbase-android"
+          # Do not silently fetch and patch a changed branch.
+          TAG_COMMIT="$(git rev-list -n1 panvk-kbase-v26.3.1)"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          [[ "$TAG_COMMIT" == "$HEAD_COMMIT" ]] || { echo "Wrong PanVK revision $HEAD_COMMIT, wanted $TAG_COMMIT" >&2; exit 2; }
+          printf 'Verified upstream PanVK tag %s\n' "$HEAD_COMMIT"
+          sh ./scripts/fetch-mesa.sh
+          # The jm-v9 patches depend on the CSF-v11 base; a standalone g57
+          # profile skips those prerequisites and fails at jm-v9/001.
+          # Use upstream's exact universal release-series patch order.
+          git -C "$PWD/work/mesa" config user.name 'SN512A CI Builder'
+          git -C "$PWD/work/mesa" config user.email 'sn512a-ci@users.noreply.github.com'
+          sh ./scripts/prepare-rc5-tree.sh --mesa "$PWD/work/mesa"
+          echo "Mesa patched at $(git -C "$PWD/work/mesa" rev-parse --short HEAD)"
+          # Fail closed on source drift; native-window probe tests real layout before import.
+          python3 "$ROOT/patches/bridge_owned_ahb_gralloc.py" "$PWD/work/mesa"
+          python3 "$ROOT/patches/instrument_android_routes.py" "$PWD/work/mesa"
+          python3 "$ROOT/patches/probe_native_anb_v10.py" "$PWD/work/mesa"
+          # V11: panvk Max VBs controls both reported limits and array capacities.
+          # V12: legacy Android gralloc SW_READ/WRITE usage for RGBA swapchain buffers.
+          python3 "$ROOT/patches/patch_vertex32.py" "$PWD/work/mesa"
+          python3 "$ROOT/patches/patch_legacy_gralloc_usage_v12.py" "$PWD/work/mesa"
+          # Universal driver contains the Mali-G57 v9 JM backend and CSF support.
+          PANVK_JOBS="${PANVK_JOBS:-2}" sh ./scripts/build-android.sh --profile g615-v11-csf --api 35 --ndk "$ANDROID_NDK_ROOT"
+          LIB="$PWD/dist/android-g615-v11-csf/libvulkan_panfrost.so"
+          sh ./scripts/validate-binary.sh --abi android "$LIB"
+          python3 "$ROOT/scripts/package_liberty_driver.py" "$LIB" "$WORK/Liberty-SN512A-PanVK-v12-VERTEX32-LEGACY-GRALLOC-UNVERIFIED.zip"
+          printf 'Built experimental ZIP at %s\n' "$WORK/Liberty-SN512A-PanVK-v12-VERTEX32-LEGACY-GRALLOC-UNVERIFIED.zip"
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/patches/patch_vertex32.py' <<'SN512A_V11_VERTEX32_EOF'
+          #!/usr/bin/env python3
+          """Lift PanVK's per-device software vertex input limit 16 -> 32.
+          
+          Only edits Mesa's PanVK MAX_VBS capacity constants. Both the advertised
+          VkPhysicalDeviceLimits values and the driver vertex buffer arrays reference
+          MAX_VBS. Does not change gralloc/swapchain code or claim 64-slot support.
+          
+          Run after the upstream pinned Mesa patch stack is prepared, before Meson.
+          Fail closed if the physical-device contract or capacity definitions drift.
+          """
+          from __future__ import annotations
+          import argparse
+          import re
+          from pathlib import Path
+          
+          MAX_VBS_DEFINE = re.compile(r"^(?P<indent>[ \t]*)#\s*define\s+MAX_VBS\s+(?P<count>\d+)(?P<trail>\s*(?://[^\n]*|/\*[^\n]*\*/\s*)?)$", re.M)
+          
+          
+          def patch_text(text: str) -> tuple[str, int]:
+              """Change only #define MAX_VBS 16 to 32, or accept idempotent 32."""
+              matches = list(MAX_VBS_DEFINE.finditer(text))
+              if not matches:
+                  return text, 0
+              if len(matches) != 1:
+                  raise ValueError(f"Expected at most one MAX_VBS definition, saw {len(matches)}")
+              m = matches[0]
+              previous = int(m.group('count'))
+              if previous not in (16, 32):
+                  raise ValueError(f"Unexpected upstream MAX_VBS={previous}; requires audit")
+              changed = MAX_VBS_DEFINE.sub(
+                  lambda match: f"{match.group('indent')}#define MAX_VBS 32{match.group('trail')}",
+                  text,
+                  count=1,
+              )
+              return changed, 1
+          
+          
+          def patch_mesa(root: Path) -> list[Path]:
+              path = root / 'src/panfrost/vulkan'
+              if not path.is_dir():
+                  raise FileNotFoundError(path)
+              # Physical device should read the capacity from MAX_VBS, not a fixed 16.
+              dev = path / 'panvk_vX_physical_device.c'
+              dev_src = dev.read_text()
+              for name in ('maxVertexInputAttributes', 'maxVertexInputBindings'):
+                  if not re.search(r'\.'+name+r'\s*=\s*MAX_VBS\s*,', dev_src):
+                      raise RuntimeError(f'Physical-device limit {name} does not follow MAX_VBS')
+              # Both common and arch-specific headers may define MAX_VBS; update all
+              # PanVK headers, never other drivers such as RADV/Turnip.
+              touched=[]
+              seen=0
+              for header in sorted(path.rglob('*.h')):
+                  src=header.read_text()
+                  edited,count=patch_text(src)
+                  if count:
+                      seen+=1
+                      touched.append(header)
+                      if edited!=src: header.write_text(edited)
+                      print('SN512A V11 vertex=32:',header.relative_to(root))
+              if not seen or not (path/'panvk_cmd_draw.h') in touched:
+                  raise RuntimeError('PanVK common MAX_VBS definition absent; stopped')
+              if any(re.search(r'^\s*#\s*define\s+MAX_VBS\s+16\b',p.read_text(),re.M) for p in touched):
+                  raise RuntimeError('Incomplete MAX_VBS replacement')
+              print('SN512A V11: PanVK will advertise maxVertexInputAttributes=32 and maxVertexInputBindings=32.')
+              print('CAUTION: device must be tested; this does not fix Android native-buffer import.')
+              return touched
+          
+          if __name__ == '__main__':
+              parser=argparse.ArgumentParser()
+              parser.add_argument('mesa_root',type=Path)
+              args=parser.parse_args()
+              patch_mesa(args.mesa_root)
+          SN512A_V11_VERTEX32_EOF
+          cat > 'sn512a-src/tests/test_vertex32_patcher.py' <<'SN512A_V11_VERTEX32_EOF'
+          #!/usr/bin/env python3
+          """Offline tests for PanVK 32-slot source patch. No fake hardware claims."""
+          import tempfile
+          from pathlib import Path
+          from sys import path
+          path.insert(0,str(Path(__file__).resolve().parents[1]/'patches'))
+          from patch_vertex32 import patch_text,patch_mesa
+          
+          assert patch_text('#define MAX_VBS 16\n')[0] == '#define MAX_VBS 32\n'
+          assert patch_text('#define MAX_VBS 32\n')[0] == '#define MAX_VBS 32\n'
+          assert patch_text('// no constant\n') == ('// no constant\n',0)
+          try: patch_text('#define MAX_VBS 64\n')
+          except ValueError: pass
+          else: raise AssertionError('Unexpected 64 must be rejected')
+          try: patch_text('#define MAX_VBS 16\n#define MAX_VBS 16\n')
+          except ValueError: pass
+          else: raise AssertionError('Duplicate define must be rejected')
+          with tempfile.TemporaryDirectory() as d:
+              root=Path(d)
+              vk=root/'src/panfrost/vulkan'
+              (vk/'csf').mkdir(parents=True)
+              (vk/'panvk_cmd_draw.h').write_text('#define MAX_VBS 16\nstruct state { unsigned vb[MAX_VBS]; };\n')
+              (vk/'csf/panvk_cmd_buffer.h').write_text('#define MAX_VBS 16\n')
+              (vk/'panvk_vX_physical_device.c').write_text('.maxVertexInputAttributes = MAX_VBS,\n.maxVertexInputBindings = MAX_VBS,\n')
+              touched=patch_mesa(root)
+              assert len(touched)==2
+              assert (vk/'panvk_cmd_draw.h').read_text().startswith('#define MAX_VBS 32\n')
+              assert (vk/'csf/panvk_cmd_buffer.h').read_text().startswith('#define MAX_VBS 32\n')
+              assert len(patch_mesa(root))==2
+              (vk/'panvk_vX_physical_device.c').write_text('.maxVertexInputAttributes = 16,\n.maxVertexInputBindings = MAX_VBS,\n')
+              try: patch_mesa(root)
+              except RuntimeError: pass
+              else: raise AssertionError('Physical-device source drift should be fatal')
+          print('SN512A V11 vertex 32 patcher tests: PASS')
+          SN512A_V11_VERTEX32_EOF
+          cat > 'sn512a-src/patches/patch_legacy_gralloc_usage_v12.py' <<'SN512A_V12_USAGE_PATCH_EOF'
+          #!/usr/bin/env python3
+          """V12: request CPU-mappable Android swapchain buffers from BOTH usage ABIs.
+          
+          V10 patched only GetSwapchainGrallocUsage2ANDROID. The SN512A log from
+          2026-11-05 shows the resulting ANativeWindow buffer AHB usage 0xb00,
+          not CPU read/write usage, and the V10 probe correctly refuses it.
+          
+          Some Android vulkan loaders call GetSwapchainGrallocUsageANDROID (legacy).
+          This patch operates in setup_gralloc0_usage(), which is called by both APIs,
+          but V10's usage2 implementation only forwards HW flags; it separately ORs
+          GRALLOC1 CPU flags. Hence when the legacy API is invoked, Android's gralloc
+          gets SW_READ_OFTEN | SW_WRITE_OFTEN and may allocate LINEAR buffers.
+          
+          The existing V10 9-cookie checked layout probe, *not* this patch, verifies
+          actual linear memory before Vulkan imports an ANB. No guessed modifiers.
+          This can still fail on restricted vendor mapper implementations or if
+          Android ignores/refuses CPU usage. The patch explicitly does not claim success.
+          """
+          from __future__ import annotations
+          import argparse
+          from pathlib import Path
+          import re
+          
+          MARKER = '[SN512A-V12-GRALLOC0]'
+          
+          BLOCK = '''   /* SN512A V12: Android's legacy GetSwapchainGrallocUsageANDROID path was
+              * not covered by V10's GrallocUsage2-only patch. Request mappable
+              * allocations for ordinary 32bpp RGBA/BGRA swapchain color targets.
+              * Mali gralloc may choose LINEAR to satisfy CPU access. The V10
+              * native-buffer cookie probe still verifies layout before importing. */
+             if ((image_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+                 (format == VK_FORMAT_R8G8B8A8_UNORM ||
+                  format == VK_FORMAT_B8G8R8A8_UNORM ||
+                  format == VK_FORMAT_R8G8B8A8_SRGB ||
+                  format == VK_FORMAT_B8G8R8A8_SRGB)) {
+                gralloc_usage |= GRALLOC_USAGE_SW_READ_OFTEN |
+                                 GRALLOC_USAGE_SW_WRITE_OFTEN;
+                static __thread bool sn512a_v12_legacy_logged;
+                if (!sn512a_v12_legacy_logged) {
+                   sn512a_v12_legacy_logged = true;
+                   mesa_logw("[SN512A-V12-GRALLOC0] RGBA swapchain requested CPU READ+WRITE; usage=0x%x format=%u image_usage=0x%x",
+                             gralloc_usage, (unsigned)format, (unsigned)image_usage);
+                }
+             }
+          '''
+          
+          
+          def find_body(src: str, function: str) -> tuple[int, int, str]:
+              # Limit scanning to function beginning, and require exactly one occurrence.
+              pattern = re.compile(r'\b' + re.escape(function) + r'\s*\(')
+              found = list(pattern.finditer(src))
+              # This function is defined and may be called elsewhere; identify the definition.
+              defs = []
+              for m in found:
+                  brace = src.find('{', m.end())
+                  semicolon = src.find(';', m.end())
+                  if brace < 0 or (0 <= semicolon < brace):
+                      continue
+                  # Ensure declaration matched normal signature (no prose string).
+                  if brace - m.end() > 320:
+                      continue
+                  depth = 0
+                  for k in range(brace, len(src)):
+                      if src[k] == '{': depth += 1
+                      if src[k] == '}':
+                          depth -= 1
+                          if depth == 0:
+                              defs.append((brace, k + 1, src[brace:k+1]))
+                              break
+              if len(defs) != 1:
+                  raise ValueError(f'Expected one {function} definition; found {len(defs)}')
+              return defs[0]
+          
+          
+          def patch(src: str) -> str:
+              if MARKER in src:
+                  if src.count(MARKER) != 1 or 'GRALLOC_USAGE_SW_WRITE_OFTEN' not in src:
+                      raise ValueError('Inconsistent prior V12 patch')
+                  return src
+              # Strict prerequisites: V10 path present; no implicit fallback on source drift.
+              if '[SN512A-V10-ANB]' not in src or '[SN512A-AHB-BRIDGE]' not in src:
+                  raise ValueError('Patch V10 native AHB validation BEFORE V12')
+              if not all(tag in src for tag in ('vk_common_GetSwapchainGrallocUsageANDROID(',
+                                                'vk_common_GetSwapchainGrallocUsage2ANDROID(')):
+                  raise ValueError('Both Android gralloc ABI entrypoints must exist')
+              a, b, body = find_body(src, 'setup_gralloc0_usage')
+              assignment = re.compile(r'^\s*\*out_gralloc_usage\s*=\s*gralloc_usage\s*;', re.M)
+              if len(assignment.findall(body)) != 1:
+                  raise ValueError('Legacy swapchain gralloc output assignment not uniquely found')
+              if 'GRALLOC_USAGE_HW_RENDER' not in body or 'GRALLOC_USAGE_HW_TEXTURE' not in body:
+                  raise ValueError('Legacy usage setup no longer matches pinned upstream contract')
+              if not re.search(r'\bif\s*\(\s*!gralloc_usage\s*\)', body):
+                  raise ValueError('Unexpected legacy usage validation path')
+              # Insert after the zero-usage check and immediately before output assignment.
+              body = assignment.sub(lambda m: '\n' + BLOCK + m.group(0), body, count=1)
+              new = src[:a] + body + src[b:]
+              assert new.count(MARKER) == 1
+              return new
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('mesa_root', type=Path)
+              parser.add_argument('--dry-run', action='store_true')
+              args = parser.parse_args()
+              source_path = args.mesa_root / 'src/vulkan/runtime/vk_android.c'
+              src = source_path.read_text()
+              edited = patch(src)
+              if args.dry_run:
+                  print('SN512A V12 legacy gralloc usage patch: source guards PASS')
+              elif edited != src:
+                  source_path.write_text(edited)
+                  print('SN512A V12 legacy gralloc swapchain usage patch installed')
+              else:
+                  print('SN512A V12 patch already present')
+          
+          if __name__ == '__main__':
+              main()
+          SN512A_V12_USAGE_PATCH_EOF
+          cat > 'sn512a-src/tests/test_legacy_gralloc_usage_v12.py' <<'SN512A_V12_USAGE_TEST_EOF'
+          #!/usr/bin/env python3
+          """V12 patcher offline tests with simulated Mesa signatures, not GPU tests."""
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'patches'))
+          from patch_legacy_gralloc_usage_v12 import patch, BLOCK
+          
+          SOURCE = '''/* [SN512A-V10-ANB] */
+          /* [SN512A-AHB-BRIDGE] */
+          static VkResult setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage, int *out_gralloc_usage)
+          {
+             int gralloc_usage = 0;
+             if (image_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+                gralloc_usage |= GRALLOC_USAGE_HW_RENDER;
+             if (image_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                gralloc_usage |= GRALLOC_USAGE_HW_TEXTURE;
+             if (!gralloc_usage)
+                return VK_ERROR_FORMAT_NOT_SUPPORTED;
+             *out_gralloc_usage = gralloc_usage;
+             return VK_SUCCESS;
+          }
+          VkResult vk_common_GetSwapchainGrallocUsageANDROID(VkDevice d,VkFormat f,VkImageUsageFlags u,int *v) {
+            return setup_gralloc0_usage(f,u,v);
+          }
+          VkResult vk_common_GetSwapchainGrallocUsage2ANDROID(VkDevice d,VkFormat f,VkImageUsageFlags u,int x,uint64_t *c,uint64_t *p) {
+            int usage; return setup_gralloc0_usage(f,u,&usage);
+          }
+          '''
+          new = patch(SOURCE)
+          assert new.count('[SN512A-V12-GRALLOC0]') == 1
+          assert new.count('GRALLOC_USAGE_SW_READ_OFTEN') == 1
+          assert new.count('GRALLOC_USAGE_SW_WRITE_OFTEN') == 1
+          assert patch(new) == new
+          assert 'return setup_gralloc0_usage(f,u,v);' in new
+          try: patch(SOURCE.replace('GRALLOC_USAGE_HW_RENDER;', 'GRALLOC_USAGE_GPU_MAGIC;'))
+          except ValueError: pass
+          else: raise AssertionError('Missing legacy hardware flags must fail closed')
+          try: patch(SOURCE.replace('vk_common_GetSwapchainGrallocUsageANDROID(', 'legacy_api_removed('))
+          except ValueError: pass
+          else: raise AssertionError('Missing legacy ABI must fail closed')
+          try: patch(SOURCE.replace('*out_gralloc_usage = gralloc_usage;', '*out_gralloc_usage = 123;'))
+          except ValueError: pass
+          else: raise AssertionError('Changed ABI must fail closed')
+          print('V12 legacy gralloc patch: guard, idempotence, source-drift tests PASS')
+          
+          # Compile and execute the modified C call path on host compiler with stand-in
+          # Vulkan/Android integer types, validating the exact SW usage bits produced.
+          import shutil
+          import subprocess
+          import tempfile
+          cc = shutil.which('clang') or shutil.which('gcc')
+          if cc:
+              head = '''#include <stdint.h>
+          #include <stdbool.h>
+          typedef int VkResult;
+          typedef int VkDevice;
+          typedef unsigned VkFormat;
+          typedef unsigned VkImageUsageFlags;
+          #define VK_SUCCESS 0
+          #define VK_ERROR_FORMAT_NOT_SUPPORTED (-11)
+          #define VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT 0x10u
+          #define VK_IMAGE_USAGE_TRANSFER_SRC_BIT 0x01u
+          #define GRALLOC_USAGE_HW_RENDER 0x200
+          #define GRALLOC_USAGE_HW_TEXTURE 0x100
+          #define GRALLOC_USAGE_SW_READ_OFTEN 0x3
+          #define GRALLOC_USAGE_SW_WRITE_OFTEN 0x30
+          #define VK_FORMAT_R8G8B8A8_UNORM 37u
+          #define VK_FORMAT_B8G8R8A8_UNORM 44u
+          #define VK_FORMAT_R8G8B8A8_SRGB 43u
+          #define VK_FORMAT_B8G8R8A8_SRGB 50u
+          #define mesa_logw(...) ((void)0)
+          '''
+              tail = '''
+          int main(void) {
+           int usage=0;
+           if(vk_common_GetSwapchainGrallocUsageANDROID(0, 37u, 0x10u, &usage) != 0)
+             return 1;
+           if(usage != 0x233) return 2;
+           if(vk_common_GetSwapchainGrallocUsageANDROID(0, 44u, 0x10u, &usage) != 0)
+             return 3;
+           if(usage != 0x233) return 4;
+           if(vk_common_GetSwapchainGrallocUsageANDROID(0, 37u, 0x1u, &usage) != 0)
+             return 5;
+           if(usage != 0x100) return 6;
+           if(vk_common_GetSwapchainGrallocUsageANDROID(0, 999u, 0x10u, &usage) != 0)
+             return 7;
+           if(usage != 0x200) return 8;
+           return 0;
+          }'''
+              with tempfile.TemporaryDirectory() as tmp:
+                  c = Path(tmp)/'test.c'
+                  out = Path(tmp)/'test'
+                  c.write_text(head + new + tail)
+                  cmd = [cc, '-std=gnu11', '-Werror', '-Wno-unused-parameter',
+                         str(c), '-o', str(out)]
+                  compilation = subprocess.run(cmd, capture_output=True, text=True)
+                  if compilation.returncode:
+                      raise RuntimeError(f'V12 C compiler test failed: {compilation.stderr}')
+                  subprocess.run([str(out)], check=True)
+              print('V12 generated legacy C: syntax and runtime CPU-usage tests PASS')
+          else:
+              print('NOTE: no host C compiler, V12 C syntax runtime test not performed')
+          SN512A_V12_USAGE_TEST_EOF
+          chmod +x sn512a-src/scripts/build_driver.sh
+          python3 sn512a-src/tests/test_legacy_gralloc_usage_v12.py
+          python3 sn512a-src/tests/test_vertex32_patcher.py
+          python3 -m py_compile sn512a-src/patches/*.py sn512a-src/scripts/*.py sn512a-src/tests/*.py
+          python3 sn512a-src/tests/test_v10_patcher.py
+          python3 sn512a-src/tests/test_c_syntax.py
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,'sn512a-src/patches')
+          from bridge_owned_ahb_gralloc import patch
+          from instrument_android_routes import apply
+          from probe_native_anb_v10 import patch as patch_v10
+          a='''static VkResult
+          vk_gralloc_to_drm_explicit_layout(struct u_gralloc_buffer_handle *in_hnd, VkImageDrmFormatModifierExplicitCreateInfoEXT *out, VkSubresourceLayout *out_layouts, int max_planes) { if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)\n return VK_ERROR_INVALID_EXTERNAL_HANDLE; }'''
+          assert callable(patch) and callable(apply) and callable(patch_v10)
+          print('Patch modules import: OK; full source validation occurs before build')
+          PY
+          # Exercise unbraced, braced, logging and fail-closed behavior without Mesa checkout.
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'sn512a-src/patches')
+          from bridge_owned_ahb_gralloc import patch
+          tls = 'static __thread const struct AHardwareBuffer *vk_android_owned_ahb;'
+          probe = 'static VkResult vk_android_probe_linear_ahb(); VkResult foo = vk_android_probe_linear_ahb(ahb);'
+          fn = ('static VkResult\nvk_gralloc_to_drm_explicit_layout(int x) {\n'
+                '  struct u_gralloc_buffer_basic_info info;\n'
+                '  struct u_gralloc *u_gralloc; struct u_gralloc_buffer_handle *in_hnd;\n')
+          c = 'if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)'
+          forms = [
+              c+'\n     return VK_ERROR_INVALID_EXTERNAL_HANDLE;',
+              c+' {\n     return VK_ERROR_INVALID_EXTERNAL_HANDLE;\n  }',
+              c+' {\n     mesa_loge("gralloc failed");\n     return VK_ERROR_INVALID_EXTERNAL_HANDLE;\n  }',
+          ]
+          for form in forms:
+              source = fn + form + '\nreturn VK_SUCCESS;\n}\n' + tls + '\n' + probe
+              patched = patch(source)
+              assert '[SN512A-AHB-BRIDGE]' in patched
+              assert patched.count('return VK_ERROR_INVALID_EXTERNAL_HANDLE;') == 1
+              assert patch(patched) == patched
+              assert patched.count('vk_android_probe_linear_ahb(') >= 4
+          print('SN512A v6 bridge: 3 guard variants + idempotence: PASS')
+          PY
+      - name: Build PanVK V12 vertex32 and legacy Android gralloc buffer fix
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source .sn512a-venv/bin/activate
+          export ANDROID_NDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}/ndk/28.2.13676358"
+          export PANVK_JOBS=2
+          bash sn512a-src/scripts/build_driver.sh "$GITHUB_WORKSPACE/sn512a-build"
+      - name: Upload ARM64 driver ZIP only if genuine build succeeds
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-SN512A-PanVK-v12-VERTEX32-LEGACY-GRALLOC-UNVERIFIED
+          path: sn512a-build/Liberty-SN512A-PanVK-v12-VERTEX32-LEGACY-GRALLOC-UNVERIFIED.zip
+          if-no-files-found: error
