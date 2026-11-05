@@ -1,0 +1,382 @@
+# SN512A: bypasses the failing direct jm-v9 001 patch by building the universal
+# Mesa stack in upstream prepare-rc5-tree.sh order (CSF-v11 before JM-v9).
+# v9: add apt connection timeouts, retries and Ubuntu mirror fallback to avoid hangs.
+# Keeps v8 X11/XCB host-header dependencies unchanged.
+# Carries forward v7 LLVM/SPIR-V and patch fixes.
+# Carries forward v6 gralloc bridge unchanged; hardware fix not verified.
+# DRIVER EXPERIMENTAL: hardware swapchain fix still unverified.
+name: SN512A PanVK v9 - APT Download Recovery
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android-driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler and build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # Prevent a stalled package mirror from blocking GitHub Actions indefinitely.
+          # Timeouts are per connection; downloads retry before switching Ubuntu mirrors.
+          APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=35 \
+                    -o Acquire::https::Timeout=35 -o Acquire::http::Pipeline-Depth=0 \
+                    -o Dpkg::Use-Pty=0)
+          packages=(
+            git build-essential cmake ninja-build pkg-config python3-venv python3-mako
+            python3-yaml python3-ply python3-packaging bison flex libzstd-dev libxml2-dev
+            libdrm-dev clang llvm gettext autoconf automake libtool
+            gperf llvm-18-dev libclang-18-dev libllvmspirvlib-18-dev llvm-spirv-18 libclc-18 libclc-18-dev
+            spirv-tools glslang-tools libxcb1-dev libx11-dev libx11-xcb-dev libxshmfence-dev libxcb-dri3-dev
+            libxcb-present-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev libxcb-randr0-dev
+          )
+          sudo apt-get "${APT_OPTS[@]}" update
+          if ! sudo -E apt-get "${APT_OPTS[@]}" install -y "${packages[@]}"; then
+            echo "APT: initial mirror failed; retrying with Ubuntu main archive"
+            # Ubuntu 24.04 GitHub images may use Azure mirrors, which can intermittently stall.
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+            if [ -f /etc/apt/sources.list ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
+            fi
+            sudo apt-get "${APT_OPTS[@]}" update
+            sudo -E apt-get "${APT_OPTS[@]}" install -y "${packages[@]}"
+          fi
+          # Exact native headers inspected by upstream scripts/prepare-x11-headers.sh.
+          for h in /usr/include/xcb/xcb.h /usr/include/X11/Xlib-xcb.h /usr/include/X11/xshmfence.h; do
+            test -f "$h" || { echo "FATAL: expected X11/XCB host header missing: $h" >&2; exit 1; }
+            echo "OK host X11/XCB header: $h"
+          done
+          pkg-config --modversion xcb x11-xcb xshmfence
+          # LLVMSPIRVLib must match the chosen LLVM 18 host toolchain.
+          echo "LLVM host version: $(llvm-config-18 --version)"
+          echo "SPIR-V translator: $(pkg-config --modversion LLVMSPIRVLib)"
+          python3 -m venv .sn512a-venv
+          source .sn512a-venv/bin/activate
+          python3 -m pip install --upgrade pip 'meson>=1.5,<2' mako pyyaml packaging
+      # v4 fixes Android SDK 'tools' package removal; only platform-tools needed.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+      - name: Install pinned Android NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'ndk;28.2.13676358'
+      - name: Expand transparent embedded source and verify Python
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p sn512a-src/patches sn512a-src/scripts sn512a-src/tests
+          cat > 'sn512a-src/patches/bridge_owned_ahb_gralloc.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Conservative, targeted bridge for Android gralloc failures in Mesa vk_android.c.
+          v6 fixes v5's false assumption that the failure guard has no braces. The
+          returned Vulkan error is preserved unless PanVK owns the exact AHB and its
+          existing checked linear-layout probe verifies the imported allocation.
+          This cannot fix unowned native-window buffers or unsupported Mali pipelines.
+          """
+          from pathlib import Path
+          import argparse
+          import re
+          MARKER = '[SN512A-AHB-BRIDGE]'
+          PROLOG = '''static struct AHardwareBuffer *
+          panvk_sn512a_owned_ahb_for_gralloc(void);
+          static VkResult
+          vk_android_probe_linear_ahb(struct AHardwareBuffer *ahb,
+                                      const AHardwareBuffer_Desc *d,
+                                      const native_handle_t *h,
+                                      VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+                                      VkSubresourceLayout *out_layouts, int max_planes);
+          '''
+          GETTER = '''static struct AHardwareBuffer *
+          panvk_sn512a_owned_ahb_for_gralloc(void)
+          {
+             return (struct AHardwareBuffer *)vk_android_owned_ahb;
+          }
+          '''
+          # Replaces ONLY the return from the u_gralloc error branch, not the success
+          # path. A compound statement is valid in both braced and unbraced if branches.
+          FALLBACK = '''{
+             struct AHardwareBuffer *owned = panvk_sn512a_owned_ahb_for_gralloc();
+             if (owned && in_hnd->handle == AHardwareBuffer_getNativeHandle(owned)) {
+                AHardwareBuffer_Desc desc;
+                AHardwareBuffer_describe(owned, &desc);
+                mesa_logw("[SN512A-AHB-BRIDGE] gralloc failed for same driver-owned AHB; testing verified linear layout: %ux%u fmt=%u stride=%u usage=0x%llx",
+                          desc.width, desc.height, desc.format, desc.stride,
+                          (unsigned long long)desc.usage);
+                return vk_android_probe_linear_ahb(owned, &desc, in_hnd->handle,
+                                                   out, out_layouts, max_planes);
+             }
+             static __thread bool sn512a_warned_not_owned;
+             if (!sn512a_warned_not_owned) {
+                sn512a_warned_not_owned = true;
+                mesa_logw("[SN512A-AHB-BRIDGE] gralloc failed for unowned or unmatched native window buffer (fmt=%u stride=%u); refusing layout guess",
+                          in_hnd->hal_format, in_hnd->pixel_stride);
+             }
+             return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+          }'''
+          def skipws(s, index):
+              while index < len(s) and s[index].isspace():
+                  index += 1
+              return index
+          def balanced_end(s, start, op='(', cl=')'):
+              """Return the position immediately after a balanced parentheses/braces group."""
+              assert s[start] == op
+              nesting = 0
+              i = start
+              quote = None
+              while i < len(s):
+                  c = s[i]
+                  if quote:
+                      if c == '\\':
+                          i += 2
+                          continue
+                      if c == quote:
+                          quote = None
+                  elif c in '\"\'':
+                      quote = c
+                  elif c == op:
+                      nesting += 1
+                  elif c == cl:
+                      nesting -= 1
+                      if nesting == 0:
+                          return i+1
+                  i += 1
+              raise ValueError('Unbalanced conditional or guard block in pinned Mesa')
+          def patch(source):
+              if MARKER in source:
+                  # The marker is only put in our own fallback; refuse a suspicious preexisting one.
+                  if 'panvk_sn512a_owned_ahb_for_gralloc' not in source:
+                      raise ValueError('Found bridge marker without bridge getter; inconsistent source')
+                  return source
+              decl = 'static __thread const struct AHardwareBuffer *vk_android_owned_ahb;'
+              fn = 'static VkResult\nvk_gralloc_to_drm_explicit_layout('
+              if source.count(fn) != 1 or source.count(decl) != 1:
+                  raise ValueError('Expected one original Mesa layout function and one owned-AHB TLS declaration')
+              if source.count('vk_android_probe_linear_ahb(') < 2:
+                  raise ValueError('Upstream validated AHB probe (android/014) missing; unsafe to bridge')
+              begin = source.index(fn)
+              search_region = source[begin:begin + 3000]
+              guards = list(re.finditer(r'\bif\s*\(\s*u_gralloc_get_buffer_basic_info\s*\(', search_region))
+              if len(guards) != 1:
+                  raise ValueError(f'Expected one u_gralloc failure test in vk_gralloc layout (found {len(guards)})')
+              cond_start = begin + guards[0].start()
+              open_paren = source.index('(', cond_start)
+              cond_end = balanced_end(source, open_paren)
+              condition = source[open_paren:cond_end]
+              if not re.search(r'!=\s*0', condition):
+                  raise ValueError('Unexpected gralloc condition; refusing source modification')
+              statement_start = skipws(source, cond_end)
+              if source[statement_start] == '{':
+                  statement_end = balanced_end(source, statement_start, '{', '}')
+              else:
+                  statement_end = source.find(';', statement_start) + 1
+                  if statement_end == 0:
+                      raise ValueError('Unterminated non-braced gralloc error statement')
+              statement = source[statement_start:statement_end]
+              target = re.compile(r'\breturn\s+VK_ERROR_INVALID_EXTERNAL_HANDLE\s*;')
+              if len(target.findall(statement)) != 1:
+                  raise ValueError(f'Error branch did not contain exactly one matching return: {statement[:250]!r}')
+              # A single, bracketed body is valid for `if` statements lacking braces.
+              repaired = target.sub(lambda _: FALLBACK, statement, count=1)
+              result = source[:statement_start] + repaired + source[statement_end:]
+              result = result.replace(fn, PROLOG + fn, 1)
+              result = result.replace(decl, decl + '\n\n' + GETTER, 1)
+              if MARKER not in result or result.count('panvk_sn512a_owned_ahb_for_gralloc(') != 3:
+                  raise AssertionError('Bridge injection sanity check failed')
+              return result
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('mesa_root', type=Path)
+              parser.add_argument('--dry-run', action='store_true')
+              args = parser.parse_args()
+              f = args.mesa_root / 'src/vulkan/runtime/vk_android.c'
+              if not f.is_file():
+                  parser.error(f'Missing Mesa Android Vulkan runtime source at {f}')
+              original = f.read_text()
+              try:
+                  changed = patch(original)
+              except ValueError as exc:
+                  print('SN512A SOURCE-DRIFT:', exc)
+                  # Output enough source to correct this without another blind guess.
+                  key = original.find('vk_gralloc_to_drm_explicit_layout(')
+                  print('Relevant upstream vk_android.c snippet:')
+                  print(original[max(0,key-70):key+1100])
+                  raise
+              if changed == original:
+                  print('Bridge already present')
+              elif args.dry_run:
+                  print('Bridge passes guard discovery and owned-AHB proof preconditions; dry run')
+              else:
+                  f.write_text(changed)
+                  print('SN512A-BRIDGE-INSTALLED:', f)
+                  print('Only owned matching AHBs receive upstream 9-cookie linear layout proof.')
+          if __name__ == '__main__':
+              main()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/patches/instrument_android_routes.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Add one-time per-thread path logs to patched Mesa vk_android.c.
+
+          The user's error log references Android vkCreateImage native buffers, not
+          necessarily the driver-owned AHB that the upstream CPU probe requires.
+          Do not weaken buffer validation: this patch only adds logs.
+          """
+          from pathlib import Path
+          import argparse
+          MARKER = '[SN512A-ROUTE]'
+
+          NATIVE = """   static __thread bool sn512a_native_seen;
+             if (!sn512a_native_seen) {
+                sn512a_native_seen = true;
+                mesa_logw("[SN512A-ROUTE] vk_android_get_anb_layout used: native window gralloc import; AHB ownership probe may be inapplicable");
+             }
+             return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,"""
+
+          # No risk to window framebuffers: both are only diagnostic statements.
+          AHB = """   static __thread bool sn512a_ahb_seen;
+             if (!sn512a_ahb_seen) {
+                sn512a_ahb_seen = true;
+                mesa_logw("[SN512A-ROUTE] vk_android_get_ahb_layout used: explicit AHardwareBuffer import");
+             }
+             VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,"""
+
+          def apply(src):
+              if MARKER in src:
+                  return src
+              # Strict, version-pinned known-Mesa anchors. Fail before modifying anything.
+              n = 'return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,'
+              a = 'VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,'
+              if src.count(n) != 1 or src.count(a) != 1:
+                  raise ValueError('Unexpected vk_android.c source layout; do not patch')
+              return src.replace(n, NATIVE, 1).replace(a, AHB, 1)
+
+          def main():
+              ap=argparse.ArgumentParser(description=__doc__)
+              ap.add_argument('mesa_root',type=Path)
+              ap.add_argument('--dry-run',action='store_true')
+              args=ap.parse_args()
+              f=args.mesa_root/'src/vulkan/runtime/vk_android.c'
+              if not f.is_file(): ap.error('Missing source: '+str(f))
+              before=f.read_text(); after=apply(before)
+              if before==after: print('Already instrumented')
+              elif args.dry_run: print('Route instrumentation anchors validated')
+              else: f.write_text(after); print('Instrumented two Mesa Android import routes:',f)
+          if __name__=='__main__': main()
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/scripts/package_liberty_driver.py' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """Create Liberty's no-root custom-driver zip from a real compiled Android .so.
+          Fails closed for an absent, non-ELF, non-aarch64 or empty shared library.
+          """
+          import sys, json, zipfile, hashlib
+          from pathlib import Path
+          if len(sys.argv)!=3: raise SystemExit('usage: package_liberty_driver.py libvulkan_panfrost.so result.zip')
+          lib,out=map(Path,sys.argv[1:])
+          blob=lib.read_bytes()
+          assert len(blob)>100000 and blob[:4]==b'\x7fELF' and blob[4]==2 and blob[5]==1, 'Expected 64-bit little-endian ELF .so'
+          assert int.from_bytes(blob[18:20],'little')==183, 'Expected AArch64 ELF machine 183'
+          meta={'name':'PanVK-SN512A-BRIDGE-v8','author':'SN512A source instrumentation','version':'0.0.8-experimental','description':'Experimental PanVK for Coosea SN512A; Attempts owned-AHB verified layout fallback, plus source-route diagnostics; not phone-tested','libraryName':'libvulkan_panfrost.so'}
+          with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as z:
+           z.writestr('meta.json',json.dumps(meta,indent=2)+'\n')
+           z.write(lib,'libvulkan_panfrost.so')
+           z.writestr('SHA256SUMS.txt',f'{hashlib.sha256(blob).hexdigest()}  libvulkan_panfrost.so\n')
+          print(out, 'sha256', hashlib.sha256(out.read_bytes()).hexdigest())
+          SN512A_SOURCE_EOF
+          cat > 'sn512a-src/scripts/build_driver.sh' <<'SN512A_SOURCE_EOF'
+          #!/usr/bin/env bash
+          # Pinned upstream build. Requires Linux, network, NDK and Meson; no fake binaries.
+          set -Eeuo pipefail
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+          WORK="${1:-$PWD/sn512a-build}"
+          mkdir -p "$WORK"; WORK="$(cd "$WORK" && pwd)"
+          for tool in git meson ninja python3; do command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 2; }; done
+          [[ -d "${ANDROID_NDK_ROOT:-}/toolchains" ]] || { echo 'ANDROID_NDK_ROOT must point to an installed Android NDK directory' >&2; exit 2; }
+          if [[ ! -d "$WORK/panvk-kbase-android/.git" ]]; then
+            git clone --single-branch --depth 1 --branch panvk-kbase-v26.3.1 \
+              https://github.com/zenithblue-oss/panvk-kbase-android.git "$WORK/panvk-kbase-android"
+          fi
+          cd "$WORK/panvk-kbase-android"
+          # Do not silently fetch and patch a changed branch.
+          TAG_COMMIT="$(git rev-list -n1 panvk-kbase-v26.3.1)"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          [[ "$TAG_COMMIT" == "$HEAD_COMMIT" ]] || { echo "Wrong PanVK revision $HEAD_COMMIT, wanted $TAG_COMMIT" >&2; exit 2; }
+          printf 'Verified upstream PanVK tag %s\n' "$HEAD_COMMIT"
+          sh ./scripts/fetch-mesa.sh
+          # The jm-v9 patches depend on the CSF-v11 base; a standalone g57
+          # profile skips those prerequisites and fails at jm-v9/001.
+          # Use upstream's exact universal release-series patch order.
+          git -C "$PWD/work/mesa" config user.name 'SN512A CI Builder'
+          git -C "$PWD/work/mesa" config user.email 'sn512a-ci@users.noreply.github.com'
+          sh ./scripts/prepare-rc5-tree.sh --mesa "$PWD/work/mesa"
+          echo "Mesa patched at $(git -C "$PWD/work/mesa" rev-parse --short HEAD)"
+          # Fail closed on source drift; do not weaken gralloc security.
+          python3 "$ROOT/patches/bridge_owned_ahb_gralloc.py" "$PWD/work/mesa"
+          python3 "$ROOT/patches/instrument_android_routes.py" "$PWD/work/mesa"
+          # Universal driver contains the Mali-G57 v9 JM backend and CSF support.
+          PANVK_JOBS="${PANVK_JOBS:-2}" sh ./scripts/build-android.sh --profile g615-v11-csf --api 35 --ndk "$ANDROID_NDK_ROOT"
+          LIB="$PWD/dist/android-g615-v11-csf/libvulkan_panfrost.so"
+          sh ./scripts/validate-binary.sh --abi android "$LIB"
+          python3 "$ROOT/scripts/package_liberty_driver.py" "$LIB" "$WORK/Liberty-SN512A-PanVK-v8-EXPERIMENTAL.zip"
+          printf 'Built experimental ZIP at %s\n' "$WORK/Liberty-SN512A-PanVK-v8-EXPERIMENTAL.zip"
+          SN512A_SOURCE_EOF
+          chmod +x sn512a-src/scripts/build_driver.sh
+          python3 -m py_compile sn512a-src/patches/*.py sn512a-src/scripts/*.py
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,'sn512a-src/patches')
+          from bridge_owned_ahb_gralloc import patch
+          from instrument_android_routes import apply
+          a='''static VkResult
+          vk_gralloc_to_drm_explicit_layout(struct u_gralloc_buffer_handle *in_hnd, VkImageDrmFormatModifierExplicitCreateInfoEXT *out, VkSubresourceLayout *out_layouts, int max_planes) { if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)\n return VK_ERROR_INVALID_EXTERNAL_HANDLE; }'''
+          assert callable(patch) and callable(apply)
+          print('Patch modules import: OK; full source validation occurs before build')
+          PY
+          # Exercise unbraced, braced, logging and fail-closed behavior without Mesa checkout.
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'sn512a-src/patches')
+          from bridge_owned_ahb_gralloc import patch
+          tls = 'static __thread const struct AHardwareBuffer *vk_android_owned_ahb;'
+          probe = 'static VkResult vk_android_probe_linear_ahb(); VkResult foo = vk_android_probe_linear_ahb(ahb);'
+          fn = ('static VkResult\nvk_gralloc_to_drm_explicit_layout(int x) {\n'
+                '  struct u_gralloc_buffer_basic_info info;\n'
+                '  struct u_gralloc *u_gralloc; struct u_gralloc_buffer_handle *in_hnd;\n')
+          c = 'if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)'
+          forms = [
+              c+'\n     return VK_ERROR_INVALID_EXTERNAL_HANDLE;',
+              c+' {\n     return VK_ERROR_INVALID_EXTERNAL_HANDLE;\n  }',
+              c+' {\n     mesa_loge("gralloc failed");\n     return VK_ERROR_INVALID_EXTERNAL_HANDLE;\n  }',
+          ]
+          for form in forms:
+              source = fn + form + '\nreturn VK_SUCCESS;\n}\n' + tls + '\n' + probe
+              patched = patch(source)
+              assert '[SN512A-AHB-BRIDGE]' in patched
+              assert patched.count('return VK_ERROR_INVALID_EXTERNAL_HANDLE;') == 1
+              assert patch(patched) == patched
+              assert patched.count('vk_android_probe_linear_ahb(') >= 4
+          print('SN512A v6 bridge: 3 guard variants + idempotence: PASS')
+          PY
+      - name: Build PanVK with CSF-v11 and JM-v9 prerequisites
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source .sn512a-venv/bin/activate
+          export ANDROID_NDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}/ndk/28.2.13676358"
+          export PANVK_JOBS=2
+          bash sn512a-src/scripts/build_driver.sh "$GITHUB_WORKSPACE/sn512a-build"
+      - name: Upload ARM64 driver ZIP only if genuine build succeeds
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-SN512A-PanVK-v8-EXPERIMENTAL-UNVERIFIED
+          path: sn512a-build/Liberty-SN512A-PanVK-v8-EXPERIMENTAL.zip
+          if-no-files-found: error
